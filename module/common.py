@@ -24,7 +24,6 @@ class conv_layer(module.Model):
         self.bn = nn.BatchNormalization(name=self.name+'_bn')
         self.relu = nn.ReLU(name=self.name+'_relu')
 
-    @tf.function
     def call(self, inputs, training=None, mask=None):
         x = self.conv(inputs,training=training)
         x = self.bn(x, training=training)

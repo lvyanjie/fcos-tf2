@@ -10,16 +10,24 @@ from model import BaseFcos
 from Loss.loss import fcos_loss
 from config.fcos_config import config as cfg
 from core.dataset import Dataset
+from core import utils
 
 model_name = 'focs_0902'
-model_saved = os.path.join(cfg.model_saved_dir, model_name)
+model_saved = os.path.join(cfg.model_saved_dir, model_name).replace('\\','/')
+print(model_saved)
+log_saved = os.path.join(cfg.log_saved_dir, model_name)
 if not os.path.exists(model_saved):
     os.makedirs(model_saved)
+if not os.path.exists(log_saved):
+    os.makedirs(log_saved)
+writer = tf.summary.create_file_writer(log_saved)
 
 # 模型训练相关参数初始化
 num_classes = len(cfg.label_def)# 1 is background
 model = BaseFcos.FCOS(num_classes=num_classes)
 print(model.summary())
+
+# training data
 trainset = Dataset()
 global_steps = tf.Variable(1, trainable=False, dtype=tf.int64)
 steps_per_epoch = len(trainset)
@@ -52,6 +60,11 @@ def train_step(step, epoch, model, batch_image, batch_true, input_height, input_
 
     with tf.GradientTape() as tape:
         batch_pred = model(batch_image)
+
+        # write summary
+        # if epoch % cfg.WRITE_IMAGE_PER_EPOCH == 0:
+        #     plot_pred_image = utils.plot_image(batch_image, batch_pred)
+
         classification_loss, centerness_loss, giou_loss, total_loss =\
             fcos_loss(batch_true, batch_pred, num_classes, input_height, input_width)
         gradients = tape.gradient(total_loss, model.trainable_variables)

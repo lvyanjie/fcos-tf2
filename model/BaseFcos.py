@@ -12,17 +12,70 @@ from config.fcos_config import config as cfg
 
 import numpy as np
 import math
-import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
-def decode_lrtb2box(regression_result, input_height, input_width):
+def decode_lrtb2box_tf(regression_result, input_height, input_width):
+    '''
+    '''
+    # 将模型输出空间映射到[0, inf)
+    regression_result = tf.exp(regression_result)
+    decode_result = []
+    f_counts = []
+    for stride in cfg.STRIDES:
+        f_h, f_w = tf.math.ceil(input_height / stride), tf.math.ceil(input_width / stride)
+        f_h, f_w = tf.cast(f_h, tf.int32), tf.cast(f_w, tf.int32)
+        f_count = f_h * f_w
+        if len(f_counts) == 0:
+            index_start = 0
+        else:
+            index_start = f_counts[-1]
+
+        f_regression = regression_result[:, index_start:index_start + f_count, :]  # batchsize
+        f_counts.append(f_count)
+
+        pos_x = tf.range(0, f_w, 1)
+        pos_y = tf.range(0, f_h, 1)
+        f_pos = tf.meshgrid(pos_y, pos_x)
+
+        f_pos = tf.convert_to_tensor(list(zip(tf.reshape(f_pos[0], [-1]), tf.reshape(f_pos[1], [-1]))),
+                                     dtype=tf.float32)
+        image_pos = tf.math.floor(stride / 2) + tf.multiply(f_pos, stride)
+        image_pos_y, image_pos_x = image_pos[:, 0], image_pos[:, 1]
+        batch_image_pos_y, batch_image_pos_x = tf.tile(image_pos_y, [cfg.BATCH_SIZE]), \
+                                               tf.tile(image_pos_x, [cfg.BATCH_SIZE])
+        batch_image_pos_y, batch_image_pos_x = tf.reshape(batch_image_pos_y, [cfg.BATCH_SIZE, f_count, 1]), \
+                                               tf.reshape(batch_image_pos_x, [cfg.BATCH_SIZE, f_count, 1])
+        l_pred, t_pred, r_pred, b_pred = tf.split(f_regression, num_or_size_splits=4, axis=-1)
+        xmin_pred, ymin_pred, xmax_pred, ymax_pred = batch_image_pos_x - l_pred, \
+                                                     batch_image_pos_y - t_pred, \
+                                                     batch_image_pos_x + r_pred, \
+                                                     batch_image_pos_y + b_pred
+
+        # 对value进行规约
+        xmin_pred = tf.clip_by_value(xmin_pred, 0, input_width)
+        ymin_pred = tf.clip_by_value(ymin_pred, 0, input_height)
+        xmax_pred = tf.clip_by_value(xmax_pred, 0, input_width)
+        ymax_pred = tf.clip_by_value(ymax_pred, 0, input_height)
+
+        f_result = tf.concat([xmin_pred, ymin_pred, xmax_pred, ymax_pred], axis=-1)
+        decode_result.append(f_result)
+
+    #  batchsize, all_feature_count, 4
+    decode_result = tf.concat(decode_result, axis=1)
+    decode_result = tf.cast(decode_result, tf.float32)
+    return decode_result
+
+def decode_lrtb2box(regression_result, input_height, input_width, is_pred=False):
     '''
     decode regression result to box
     :param input_width: 用于计算feature size
     :param input_height: 同上
     :param regression_result: l_star, r_star, t_star, b_star
+    :param is_gt: 是否时groundtruth，如果是predication，则需要进行exp操作
     :return:
     '''
+    # 将regression_result映射到[0,inf)区间内
+    if is_pred:
+        regression_result = np.exp(regression_result)
     # 基于input_height, input_width 对每一层feature的regression结果进行抓取
     decode_result = []
     f_counts= []  #用于从总体结果中获取结果切片
@@ -70,7 +123,7 @@ def decode_lrtb2box(regression_result, input_height, input_width):
 
     #  batchsize, all_feature_count, 4
     decode_result = np.concatenate(decode_result, axis=1)
-    return decode_result
+    return decode_result.astype(np.float32)
 
 def gt_based_bbox_sigle_image(bbox, input_height, input_width, object_num):
     '''
@@ -81,17 +134,17 @@ def gt_based_bbox_sigle_image(bbox, input_height, input_width, object_num):
     '''
     num_classes = len(cfg.label_def)
     strides = cfg.STRIDES
-    valid_gtboxes = bbox[:object_num]
+    valid_gtboxes = bbox[:object_num]  # gt_boxes
 
-    all_gt = []  # 按层存储
+    all_gt = []
     for i, stride in enumerate(strides):
-
         # feature map
         feature_height, feature_width = math.ceil(input_height/stride), math.ceil(input_width/stride)
         # 基于feature_height, feature_width 进行grid网格
         gt_cls_labels = np.zeros(shape=(feature_height, feature_width)) #用于label定义
         gt_reg_targets = np.zeros(shape=(feature_height, feature_width, 4)) #用于regression traget定义
         gt_center_ness = np.zeros(shape=(feature_height, feature_width)) # 用于center ness
+        gt_point_bbox = np.zeros(shape=(feature_height, feature_width, 4)) # 存放每个点对应的bbox，用于计算regression loss
         f_min_area = np.zeros(shape=(feature_height, feature_width)) #用于最佳box的映射
 
         feature_gt_boxes = valid_gtboxes.copy()
@@ -105,19 +158,15 @@ def gt_based_bbox_sigle_image(bbox, input_height, input_width, object_num):
             xmin, ymin, xmax, ymax = int(math.ceil(xmin)), int(math.ceil(ymin)), int(math.floor(xmax)), int(math.floor(ymax))
 
             # box映射到当前feature map失败
+            # 过小目标映射到当前feature map上消失， 即限制不等于0
             if xmax <= xmin or ymax <= ymin:
                 continue
 
-            # 修正可能出现的情况
-            if xmin == xmax:
-                xmax = xmin + 1
-            if ymin == ymax:
-                ymax = ymin + 1
-
             label_region = gt_cls_labels[ymin:ymax, xmin:xmax]
-            area_region = f_min_area[ymin:ymax, xmin:xmax] #面积update
             reg_region = gt_reg_targets[ymin:ymax, xmin:xmax, :] # regression
             center_region = gt_center_ness[ymin:ymax, xmin:xmax] # center ness
+            area_region = f_min_area[ymin:ymax, xmin:xmax]  # 面积update
+            point_box_region = gt_point_bbox[ymin:ymax, xmin:xmax, :] # gt point box
 
             # 计算 l_star, r_star, t_star, b_star
             pos_x = np.arange(xmin, xmax, 1)
@@ -130,15 +179,14 @@ def gt_based_bbox_sigle_image(bbox, input_height, input_width, object_num):
             r_star = xmax_image - x  # total_count, 1
             t_star = y - ymin_image
             b_star = ymax_image - y
+
             # 生成对应网格的值
+            l_star = np.reshape(l_star, [-1,1])
+            t_star = np.reshape(t_star, [-1,1])
+            r_star = np.reshape(r_star, [-1,1])
+            b_star = np.reshape(b_star, [-1,1])
             grid_reg = np.concatenate([l_star, t_star, r_star, b_star], axis=-1)  # all_pos, 4
             grid_reg = np.reshape(grid_reg, ((ymax - ymin), (xmax - xmin), 4))
-
-            # 添加维度
-            l_star = np.expand_dims(l_star, axis=-1)
-            r_star = np.expand_dims(r_star, axis=-1)
-            t_star = np.expand_dims(t_star, axis=-1)
-            b_star = np.expand_dims(b_star, axis=-1)
 
             # 计算 center-ness targets
             lr_star = np.concatenate([l_star, r_star], axis=-1)
@@ -151,33 +199,31 @@ def gt_based_bbox_sigle_image(bbox, input_height, input_width, object_num):
             bbox_area = (xmax - xmin) * (ymax - ymin)
 
             # 对于area为0的，表示还未进行初始化状态，则直接进行赋值操作
-            label_region = np.where(area_region==0, label, label_region)
-
-            reg_region[:,:,0] = np.where(area_region==0, grid_reg[:,:,0], reg_region[:,:,0])
-            reg_region[:,:,1] = np.where(area_region==0, grid_reg[:,:,1], reg_region[:,:,1])
-            reg_region[:,:,2] = np.where(area_region==0, grid_reg[:,:,2], reg_region[:,:,2])
-            reg_region[:,:,3] = np.where(area_region==0, grid_reg[:,:,3], reg_region[:,:,3])
-
-            center_region = np.where(area_region==0, grid_center, center_region)
-            area_region = np.where(area_region == 0, bbox_area, area_region)
+            y, x = np.where(area_region==0)   # 可能存在只有部分
+            # 当y以及x不为空时，对相应位置的值进行更新
+            if len(y)>0 and len(x)>0:
+                label_region[y, x] = label
+                reg_region[y, x, :] = grid_reg[y, x, :]
+                center_region[y, x] = grid_center[y, x]
+                area_region[y, x] = bbox_area
+                point_box_region[y, x, :] = np.tile(np.array([[xmin_image, ymin_image, xmax_image, ymax_image]]), reps=[len(y), 1])
 
             # 对于原始矩阵中,area>0的部分，需要进行比较
             # a. label更新，只对面积大于当前bbox area的点进行更新, 更新的目标为当前的最佳obj（取面积小的object作为最佳映射目标）
-            label_region = np.where(area_region>bbox_area, label, label_region)
-
-            reg_region[:, :, 0] = np.where(area_region>bbox_area, grid_reg[:, :, 0], reg_region[:, :, 0])
-            reg_region[:, :, 1] = np.where(area_region>bbox_area, grid_reg[:, :, 1], reg_region[:, :, 1])
-            reg_region[:, :, 2] = np.where(area_region>bbox_area, grid_reg[:, :, 2], reg_region[:, :, 2])
-            reg_region[:, :, 3] = np.where(area_region>bbox_area, grid_reg[:, :, 3], reg_region[:, :, 3])
-
-            center_region = np.where(area_region>bbox_area, grid_center, center_region)
-            area_region = np.where(area_region > bbox_area, bbox_area, area_region)
+            y, x = np.where(area_region > bbox_area)
+            if len(y)>0 and len(x)>0:
+                label_region[y, x] = label
+                reg_region[y, x, :] = grid_reg[y, x, :]
+                center_region[y, x] = grid_center[y, x]
+                area_region[y, x] = bbox_area
+                point_box_region[y, x, :] = np.tile(np.array([[xmin_image, ymin_image, xmax_image, ymax_image]]), reps=[len(y), 1])
 
             # 将update完成的region 更新到整图
             gt_cls_labels[ymin:ymax, xmin:xmax] = label_region
             f_min_area[ymin:ymax, xmin:xmax] = area_region # 面积update
             gt_reg_targets[ymin:ymax, xmin:xmax, :] = reg_region # regression
             gt_center_ness[ymin:ymax, xmin:xmax] = center_region # center ness
+            gt_point_bbox[ymin:ymax, xmin:xmax, :] = point_box_region # point ground truth
 
         # 根据每个点的l_star, t_star, r_star, b_star 更新对应的class
         m_previous, m = cfg.MAX_SIZE_EACH_MAP[i], cfg.MAX_SIZE_EACH_MAP[i+1]
@@ -188,12 +234,13 @@ def gt_based_bbox_sigle_image(bbox, input_height, input_width, object_num):
         # 最后一个维度用于进行one-hot编码
         gt_cls_labels = np.eye(num_classes)[gt_cls_labels.astype(np.int32)]  #one-hot编码
         gt_center_ness = np.expand_dims(gt_center_ness, axis=-1)
-        gt = np.concatenate([gt_cls_labels, gt_center_ness, gt_reg_targets], axis=-1)
-        gt = np.reshape(gt, newshape=(-1, num_classes + 1 + 4))
+        gt = np.concatenate([gt_cls_labels, gt_center_ness, gt_reg_targets, gt_point_bbox], axis=-1)
+        gt = np.reshape(gt, newshape=(-1, num_classes + 1 + 4 + 4))
         all_gt.append(gt)
 
     all_gt = np.concatenate(all_gt, axis=0)
-    return all_gt
+    # 每个点对应的 bbox 返回，方便loss计算
+    return all_gt.astype(np.float32)
 
 def groundtruth(batch_image, batch_bboxes, batch_valid_count):
     '''
@@ -272,7 +319,6 @@ class classification(module.Model):
         # 加1表示center_ness
         self.classification = nn.Conv2D(out_channel, 1, 1, activation='sigmoid', name='classification')
 
-    @tf.function
     def call(self, inputs, training=None, mask=None):
         '''
         :param inputs:
@@ -297,7 +343,6 @@ class regression(module.Model):
 
         self.regression = nn.Conv2D(4, 1, 1, activation=None, name='regression')
 
-    @tf.function
     def call(self, inputs, training=None, mask=None):
         '''
         :param inputs:
@@ -353,6 +398,7 @@ def FCOS(num_classes,
 
     # classfication an regression for all fpn features
     p_outs = [] # save all classification , center_ness, regression result
+
     for i, feature in enumerate(p_features):
         classification_out = classification_head(feature) # batch, feature_height, feature_width, num_classes+1
         regression_out = regression_head(feature)   #batch, feature_height, feature_width, 4

@@ -56,7 +56,7 @@ class Dataset(object):
                 image_path = self.image_id[index]
                 img, bbox, objects_number = self.get_data(image_path)
                 # 对 image 进行预处理
-                scale, scale_img = utils.resize_based_scale(img, cfg.MIN_SIZE, cfg.MAX_SIZE) # 获取scale
+                scale, scale_img = utils.resize_based_scale_new(img, cfg.MIN_SIZE, cfg.MAX_SIZE) # 获取scale
                 # 根据scale，修正box
 
                 scale_bbox = utils.map_bbox_to_scaleimage(bbox, scale)
@@ -83,16 +83,7 @@ class Dataset(object):
         :return:
         '''
         # 获取 max height 和 max width
-        allh, allw = [], []
-        for image in batch_image:
-            height, width, _ = image.shape
-            allh.append(height)
-            allw.append(width)
-        batch_height, batch_width = max(allh), max(allw)
-        if batch_height < cfg.MIN_SIZE:
-            batch_height = cfg.MIN_SIZE
-        elif batch_width < cfg.MIN_SIZE:
-            batch_width = cfg.MIN_SIZE
+        batch_height = batch_width = cfg.MAX_SIZE
 
         final_batch_image = np.zeros(shape=(len(batch_image), batch_height, batch_width, 3))
         for i, image in enumerate(batch_image):
