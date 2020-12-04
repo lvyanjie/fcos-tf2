@@ -18,15 +18,11 @@ def fcos_loss(y_true, y_pred, num_classes, input_height, input_width):
     '''
     y_true_classification = y_true[:,:,:num_classes]
     y_true_centerness = y_true[:,:,num_classes]
-    y_true_regression = y_true[:,:,num_classes+1:]
+    y_true_regression = y_true[:,:,-4:]   # true box
 
     y_pred_classification = y_pred[:,:,:num_classes]
     y_pred_centerness = y_pred[:,:,num_classes]
     y_pred_regression = y_pred[:,:,num_classes+1:]
-
-    # classification loss
-    classification_loss = focal_loss(y_true_classification, y_pred_classification,
-                                     alpha = cfg.ALPHA, gamma=cfg.GAMMA)
 
     # only compute positive loss
     # shape: batchsize, numpoints
@@ -39,13 +35,13 @@ def fcos_loss(y_true, y_pred, num_classes, input_height, input_width):
 
     # regression loss
     # true regression decode
-    true_decode_bboxes = BaseFcos.decode_lrtb2box(y_true_regression, input_height, input_width)
-    pred_decode_bboxes = BaseFcos.decode_lrtb2box(y_pred_regression, input_height, input_width)
+    # true_decode_bboxes = BaseFcos.decode_lrtb2box(y_true_regression, input_height, input_width)
+    pred_decode_bboxes = BaseFcos.decode_lrtb2box_tf(y_pred_regression, input_height, input_width)
 
     # label shape: batchsize, num_points
     label_ref = tf.tile(tf.expand_dims(label, axis=-1), [1,1,4]) # batchsize, num_points, 4
 
-    true_decode_bboxes_valid = tf.gather_nd(true_decode_bboxes, tf.where(label_ref>0))  #1D
+    true_decode_bboxes_valid = tf.gather_nd(y_true_regression, tf.where(label_ref>0))  #1D
     pred_decode_bboxes_valid = tf.gather_nd(pred_decode_bboxes, tf.where(label_ref>0))
     true_decode_bboxes_valid = tf.reshape(true_decode_bboxes_valid, [-1, 4])
     pred_decode_bboxes_valid = tf.reshape(pred_decode_bboxes_valid, [-1, 4])
@@ -54,6 +50,13 @@ def fcos_loss(y_true, y_pred, num_classes, input_height, input_width):
     px1, py1, px2, py2 = tf.split(pred_decode_bboxes_valid, num_or_size_splits=4, axis=-1)
 
     giou_loss = regression_loss([tx1, ty1, tx2, ty2], [px1, py1, px2, py2])
+
+    # classification loss
+    y_true_classification_valid = tf.gather_nd(y_true_classification, tf.where(label_ref>0))
+    y_pred_classification_valid = tf.gather_nd(y_pred_classification, tf.where(label_ref>0))
+    classification_loss = focal_loss(y_true_classification_valid,\
+                                     y_pred_classification_valid,\
+                                     alpha=cfg.ALPHA, gamma=cfg.GAMMA)
 
     weight_cls, weight_centerness, weight_reg = cfg.loss_weight
 
@@ -71,8 +74,8 @@ def focal_loss(y_true, y_pred, alpha=0.25, gamma=2):
     epison = 1e-07
 
     # reshape
-    y_true = tf.reshape(y_true, [-1])  # flatten
-    y_pred = tf.reshape(y_pred, [-1])
+    # y_true = tf.reshape(y_true, [-1])  # flatten
+    # y_pred = tf.reshape(y_pred, [-1])
     y_pred = tf.clip_by_value(y_pred, clip_value_min=epison, clip_value_max=1 - epison)
     p_t = tf.where(tf.equal(y_true, 1), y_pred, 1 - y_pred)
     # alpha
